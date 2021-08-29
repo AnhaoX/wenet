@@ -272,7 +272,8 @@ if __name__ == '__main__':
                     'cv_loss': cv_loss,
                     'step': executor.step
                 })
-            writer.add_scalars('epoch', {'cv_loss': cv_loss, 'lr': lr}, epoch)
+            writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
+            writer.add_scalar('epoch/lr', lr, epoch)
         final_epoch = epoch
 
     if final_epoch is not None and args.rank == 0:
@@ -282,3 +283,4 @@ if __name__ == '__main__':
         except FileExistsError:
             os.remove(final_model_path)
             os.symlink('{}.pt'.format(final_epoch), final_model_path)
+        writer.close()
