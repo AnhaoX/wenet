@@ -41,6 +41,7 @@ class WarmupLR(_LRScheduler):
 
     def get_lr(self):
         step_num = self.last_epoch + 1
+        assert step_num > 0
         return [
             lr
             * self.warmup_steps ** 0.5
@@ -50,3 +51,9 @@ class WarmupLR(_LRScheduler):
 
     def set_step(self, step: int):
         self.last_epoch = step
+
+    def update_lr(self):
+        values = self.get_lr()
+        for group, lr in zip(self.optimizer.param_groups, values):
+            group['lr'] = lr
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
