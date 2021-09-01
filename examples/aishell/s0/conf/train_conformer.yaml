@@ -70,12 +70,12 @@ dataset_conf:
     min_length: 0
     batch_type: 'static' # static or dynamic
     # the size of batch_size should be set according to your gpu memory size, here we used 2080ti gpu whose memory size is 11GB
-    batch_size: 16
+    batch_size: 60
     sort: true
 
 grad_clip: 5
 accum_grad: 4
-max_epoch: 240
+max_epoch: 100
 log_interval: 100
 
 optim: adam
@@ -83,4 +83,4 @@ optim_conf:
     lr: 0.002
 scheduler: warmuplr     # pytorch v1.1.0+ required
 scheduler_conf:
-    warmup_steps: 25000
+    warmup_steps: 6000

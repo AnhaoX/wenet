@@ -6,13 +6,8 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
-stage=0 # start from 0 if you need to start from data preparation
-stop_stage=6
+stage=4 # start from 0 if you need to start from data preparation
+stop_stage=5
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -22,7 +17,7 @@ num_nodes=1
 # the third one set node_rank 2, and so on. Default 0
 node_rank=0
 # data
-data=/export/data/asr-data/OpenSLR/33/
+data=/mnt/nfs/ptm1/open-data/aishell
 data_url=www.openslr.org/resources/33
 
 nj=16
@@ -47,7 +42,7 @@ checkpoint=
 average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=30
-decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+decode_modes=(ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring)
 
 . tools/parse_options.sh || exit 1;
 
@@ -77,7 +72,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
         cp -r data/$x $feat_dir
     done
 
-    tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
+    tools/compute_cmvn_stats.py --num_workers 64 --train_config $train_config \
         --in_scp data/${train_set}/wav.scp \
         --out_cmvn $feat_dir/$train_set/global_cmvn
 
@@ -96,7 +91,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
-    nj=32
+    nj=64
     # Prepare wenet requried data
     echo "Prepare data, prepare requried format"
     for x in dev test ${train_set}; do
@@ -116,10 +111,10 @@ fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     # Training
-    mkdir -p $dir
+    mkdir -p $dir/log
     INIT_FILE=$dir/ddp_init
     # You had better rm it manually before you start run.sh on first node.
-    # rm -f $INIT_FILE # delete old one before starting
+    rm -f $INIT_FILE 2>/dev/null # delete old one before starting
     init_method=file://$(readlink -f $INIT_FILE)
     echo "$0: init method is $init_method"
     # The number of gpus runing on each node/machine
@@ -156,7 +151,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
             --ddp.dist_backend $dist_backend \
             --num_workers 2 \
             $cmvn_opts \
-            --pin_memory
+            --pin_memory &>$dir/log/train.rank-$rank.log || exit 1
     } &
     done
     wait
@@ -178,11 +173,14 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     decoding_chunk_size=
     ctc_weight=0.5
     reverse_weight=0.0
-    for mode in ${decode_modes}; do
+    for i in `seq ${#decode_modes[*]}`; do
     {
+        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$i)
+        mode=${decode_modes[((i-1))]}
+        echo "$mode on $gpu_id..."
         test_dir=$dir/test_${mode}
         mkdir -p $test_dir
-        python wenet/bin/recognize.py --gpu 0 \
+        python wenet/bin/recognize.py --gpu $gpu_id \
             --mode $mode \
             --config $dir/train.yaml \
             --test_data $feat_dir/test/format.data \
@@ -194,13 +192,14 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             --ctc_weight $ctc_weight \
             --reverse_weight $reverse_weight \
             --result_file $test_dir/text \
-            ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+            ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} &>$test_dir/log.txt || exit 1
          python tools/compute-wer.py --char=1 --v=1 \
             $feat_dir/test/text $test_dir/text > $test_dir/wer
+         wer=`grep Overall $test_dir/wer`
+         echo "$mode: $wer"
     } &
     done
     wait
-
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
