@@ -3,16 +3,16 @@
 # Copyright 2019 Mobvoi Inc. All Rights Reserved.
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
-stage=0 # start from 0 if you need to start from data preparation
-stop_stage=6
+stage=4 # start from 0 if you need to start from data preparation
+stop_stage=5
+
+cmd="queue.pl -l h=*0[6-8]"
+#cmd="queue.pl"
+
+world_size=24
+# Use "nccl" if it works, otherwise use "gloo"
+dist_backend="nccl"
+
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -41,8 +41,8 @@ train_set=train
 # 4. conf/train_unified_transformer.yaml: Unified dynamic chunk transformer
 train_config=conf/train_unified_transformer.yaml
 cmvn=true
-dir=exp/transformer
-checkpoint=
+dir=exp/transformer-gpu${world_size}-${dist_backend}
+checkpoint=$dir/8.pt
 
 # use average_checkpoint will get better result
 average_checkpoint=true
@@ -76,8 +76,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
 
     tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
         --in_scp data/${train_set}/wav.scp \
-        --out_cmvn $feat_dir/$train_set/global_cmvn
-
+        --out_cmvn $feat_dir/$train_set/global_cmvn || exit 1
 fi
 
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
@@ -107,7 +106,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
             --max_output_len 400 \
             --max_output_input_ratio 10.0 \
             --data_file $feat_dir/$x/format.data.tmp \
-            --output_data_file $feat_dir/$x/format.data
+            --output_data_file $feat_dir/$x/format.data || exit 1
     done
 fi
 
@@ -116,18 +115,13 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     mkdir -p $dir
     INIT_FILE=$dir/ddp_init
     # You had better rm it manually before you start run.sh on first node.
-    # rm -f $INIT_FILE # delete old one before starting
+    rm -f $INIT_FILE 2>/dev/null # delete old one before starting
     init_method=file://$(readlink -f $INIT_FILE)
     echo "$0: init method is $init_method"
-    # The number of gpus runing on each node/machine
-    num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
-    # Use "nccl" if it works, otherwise use "gloo"
-    dist_backend="nccl"
     # The total number of processes/gpus, so that the master knows
     # how many workers to wait for.
     # More details about ddp can be found in
     # https://pytorch.org/tutorials/intermediate/dist_tuto.html
-    world_size=`expr $num_gpus \* $num_nodes`
     echo "total gpus is: $world_size"
     cmvn_opts=
     $cmvn && cp ${feat_dir}/${train_set}/global_cmvn $dir
@@ -135,13 +129,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     # train.py will write $train_config to $dir/train.yaml with model input
     # and output dimension, train.yaml will be used for inference or model
     # export later
-    for ((i = 0; i < $num_gpus; ++i)); do
-    {
-        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+    $cmd --gpu 1 JOB=1:$world_size $dir/log/train.JOB.log \
+        python wenet/bin/train.py \
+            --use_gpu=wait \
             --config $train_config \
             --train_data $feat_dir/$train_set/format.data \
             --cv_data $feat_dir/dev/format.data \
@@ -149,13 +139,10 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
             --model_dir $dir \
             --ddp.init_method $init_method \
             --ddp.world_size $world_size \
-            --ddp.rank $rank \
+            --ddp.rank \$[JOB-1] \
             --ddp.dist_backend $dist_backend \
             --num_workers 2 \
-            $cmvn_opts
-    } &
-    done
-    wait
+            $cmvn_opts || exit 1
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -177,7 +164,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     {
         test_dir=$dir/test_${mode}
         mkdir -p $test_dir
-        python wenet/bin/recognize.py --gpu 0 \
+        $cmd $test_dir/test_$mode.log python wenet/bin/recognize.py \
+            --use_gpu optional \
             --mode $mode \
             --config $dir/train.yaml \
             --test_data $feat_dir/test/format.data \
@@ -191,10 +179,11 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
          python tools/compute-wer.py --char=1 --v=1 \
             $feat_dir/test/text $test_dir/text > $test_dir/wer
+         wer=`grep Overall $test_dir/wer`
+         echo "$mode: $wer"
     } &
     done
     wait
-
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then

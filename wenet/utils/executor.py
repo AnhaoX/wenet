@@ -24,8 +24,8 @@ class Executor:
         accum_grad = args.get('accum_grad', 1)
         is_distributed = args.get('is_distributed', True)
         use_amp = args.get('use_amp', False)
-        logging.info('using accumulate grad, new batch size is {} times'
-                     'larger than before'.format(accum_grad))
+        logging.info('using accumulate grad, new batch size is {} time(s)'
+                     ' larger than before'.format(accum_grad))
         if use_amp:
             assert scaler is not None
         num_seen_utts = 0

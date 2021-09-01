@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from wenet.dataset.dataset import AudioDataset, CollateFunc
 from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint
+from wenet.utils.gpu_util import select_gpu_device
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='recognize with your model')
@@ -36,6 +37,13 @@ if __name__ == '__main__':
                         type=int,
                         default=-1,
                         help='gpu id for this rank, -1 for cpu')
+    parser.add_argument('--use_gpu',
+                        dest='use_gpu',
+                        default='no',
+                        type=str,
+                        choices=['yes', 'no', 'optional', 'wait' ],
+                        help='Mode for GPU selection. Refer to'
+                        ' wenet/utils/gpu_utils.py for more details.')
     parser.add_argument('--checkpoint', required=True, help='checkpoint model')
     parser.add_argument('--dict', required=True, help='dict file')
     parser.add_argument('--beam_size',
@@ -85,7 +93,6 @@ if __name__ == '__main__':
     print(args)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
     if args.mode in ['ctc_prefix_beam_search', 'attention_rescoring'
                      ] and args.batch_size > 1:
@@ -134,8 +141,12 @@ if __name__ == '__main__':
     eos = len(char_dict) - 1
 
     load_checkpoint(model, args.checkpoint)
-    use_cuda = args.gpu >= 0 and torch.cuda.is_available()
-    device = torch.device('cuda' if use_cuda else 'cpu')
+
+    device, gpu_id = select_gpu_device(args.use_gpu, 2, 30)
+    if device is None:
+        logging.error('Failed to get any computing device.') 
+        sys.exit(-1)
+
     model = model.to(device)
 
     model.eval()

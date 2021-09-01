@@ -18,11 +18,14 @@ import argparse
 import copy
 import logging
 import os
+import sys
 
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 import yaml
+
+from datetime import timedelta
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
@@ -30,6 +33,7 @@ from wenet.dataset.dataset import AudioDataset, CollateFunc
 from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint, save_checkpoint
 from wenet.utils.executor import Executor
+from wenet.utils.gpu_util import select_gpu_device
 from wenet.utils.scheduler import WarmupLR
 
 if __name__ == '__main__':
@@ -41,6 +45,13 @@ if __name__ == '__main__':
                         type=int,
                         default=-1,
                         help='gpu id for this local rank, -1 for cpu')
+    parser.add_argument('--use_gpu',
+                        dest='use_gpu',
+                        default='no',
+                        type=str,
+                        choices=['yes', 'no', 'optional', 'wait' ],
+                        help='Mode for GPU selection. Refer to'
+                        ' wenet/utils/gpu_utils.py for more details.')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--checkpoint', help='checkpoint model')
     parser.add_argument('--tensorboard_dir',
@@ -66,6 +77,13 @@ if __name__ == '__main__':
                         dest='init_method',
                         default=None,
                         help='ddp init method')
+    parser.add_argument('--ddp.timeout',
+                        dest='timeout',
+                        default=30,
+                        type=int,
+                        help='Timeout (in minute) for initiating distributed'
+                        ' process group; also will be valid in GPU selection'
+                        ' if --use_gpu=wait is specified.')
     parser.add_argument('--num_workers',
                         default=0,
                         type=int,
@@ -84,14 +102,18 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     # Set random seed
     torch.manual_seed(777)
-    print(args)
+    logging.info(args)
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
     distributed = args.world_size > 1
+    if distributed and args.use_gpu not in ['yes', 'wait']:
+        logging.error('Training in dstributed mode as --ddp.world_size={} (>1)'
+            ' is specified. Please set --use_gpu=yes|wait instead of \'{}\''
+            ' which is passed.'.format(args.world_size, args.use_gpu))
+        sys.exit(-1)
 
     raw_wav = configs['raw_wav']
 
@@ -114,19 +136,25 @@ if __name__ == '__main__':
                                  raw_wav=raw_wav)
     cv_dataset = AudioDataset(args.cv_data, **dataset_conf, raw_wav=raw_wav)
 
+    device, gpu_id = select_gpu_device(args.use_gpu, 2, args.timeout)
+    if device is None:
+        logging.error('Failed to get any computing device.')
+        sys.exit(-1)
+
     if distributed:
-        logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))
+        torch.cuda.set_device(gpu_id)
+        logging.info('training on multiple gpus, rank-{} selected gpu-{} from'
+            ' {} gpu(s)'.format(args.rank, gpu_id, torch.cuda.device_count()))
         dist.init_process_group(args.dist_backend,
                                 init_method=args.init_method,
                                 world_size=args.world_size,
-                                rank=args.rank)
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset, shuffle=True)
-        cv_sampler = torch.utils.data.distributed.DistributedSampler(
-            cv_dataset, shuffle=False)
-    else:
-        train_sampler = None
-        cv_sampler = None
+                                rank=args.rank,
+                                timeout=timedelta(minutes=args.timeout))
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, shuffle=True) if distributed else None
+    cv_sampler = torch.utils.data.distributed.DistributedSampler(
+        cv_dataset, shuffle=False) if distributed else None
 
     train_data_loader = DataLoader(train_dataset,
                                    collate_fn=train_collate_func,
@@ -163,9 +191,9 @@ if __name__ == '__main__':
 
     # Init asr model from configs
     model = init_asr_model(configs)
-    print(model)
+    logging.info(model)
     num_params = sum(p.numel() for p in model.parameters())
-    print('the number of model params: {}'.format(num_params))
+    logging.info('the number of model params: {}'.format(num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
@@ -176,7 +204,7 @@ if __name__ == '__main__':
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:
-        infos = load_checkpoint(model, args.checkpoint)
+        infos = load_checkpoint(model, args.checkpoint, gpu_id)
     else:
         infos = {}
     start_epoch = infos.get('epoch', -1) + 1
@@ -191,19 +219,13 @@ if __name__ == '__main__':
         exp_id = os.path.basename(model_dir)
         writer = SummaryWriter(os.path.join(args.tensorboard_dir, exp_id))
 
+    model.to(device)
     if distributed:
-        assert (torch.cuda.is_available())
-        # cuda model is required for nn.parallel.DistributedDataParallel
-        model.cuda()
         model = torch.nn.parallel.DistributedDataParallel(
-            model, find_unused_parameters=True)
-        device = torch.device("cuda")
-    else:
-        use_cuda = args.gpu >= 0 and torch.cuda.is_available()
-        device = torch.device('cuda' if use_cuda else 'cpu')
-        model = model.to(device)
+            model, device_ids = [device], find_unused_parameters=True)
 
     optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
+    configs['scheduler_conf']['last_epoch'] = step
     scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
     final_epoch = None
     configs['rank'] = args.rank
@@ -215,7 +237,6 @@ if __name__ == '__main__':
 
     # Start training loop
     executor.step = step
-    scheduler.set_step(step)
     # used for pytorch amp mixed precision training
     scaler = None
     if args.use_amp:
@@ -230,7 +251,7 @@ if __name__ == '__main__':
         total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
                                                 configs)
         if args.world_size > 1:
-            # all_reduce expected a sequence parameter, so we use [num_seen_utts].
+            # all_reduce expects a sequence argument, so we use [num_seen_utts].
             num_seen_utts = torch.Tensor([num_seen_utts]).to(device)
             # the default operator in all_reduce function is sum.
             dist.all_reduce(num_seen_utts)
@@ -256,4 +277,8 @@ if __name__ == '__main__':
 
     if final_epoch is not None and args.rank == 0:
         final_model_path = os.path.join(model_dir, 'final.pt')
-        os.symlink('{}.pt'.format(final_epoch), final_model_path)
+        try:
+            os.symlink('{}.pt'.format(final_epoch), final_model_path)
+        except FileExistsError:
+            os.remove(final_model_path)
+            os.symlink('{}.pt'.format(final_epoch), final_model_path)

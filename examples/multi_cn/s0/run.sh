@@ -6,14 +6,13 @@
 
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
-stage=0 # start from 0 if you need to start from data preparation
+stage=5 # start from 0 if you need to start from data preparation
 stop_stage=5
 
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
+cmd="queue.pl --gpu 1"
+cmd=run.pl
+world_size=8
+
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -24,7 +23,7 @@ num_nodes=1
 node_rank=0
 
 # data
-dbase=/ssd/nfs06/di.wu/open_source
+dbase=/mnt/nfs/ptm1/open-data
 aidatatang_url=www.openslr.org/resources/62
 aishell_url=www.openslr.org/resources/33
 magicdata_url=www.openslr.org/resources/68
@@ -53,7 +52,7 @@ train_config=conf/train_conformer.yaml
 en_modeling_unit=bpe
 dict=data/dict_$en_modeling_unit/lang_char.txt
 cmvn=true
-dir=exp/conformer
+dir=exp/conformer-gpu$world_size-amp-batch48-epoch80
 checkpoint=
 
 # use average_checkpoint will get better result
@@ -91,8 +90,8 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     local/magicdata_data_prep.sh $dbase/magicdata/ data/magicdata || exit 1;
     local/primewords_data_prep.sh $dbase/primewords data/primewords || exit 1;
     local/stcmds_data_prep.sh $dbase/stcmds data/stcmds || exit 1;
-    local/tal_data_prep.sh $dbase/TAL/TAL_ASR data/tal_asr || exit 1;
-    local/tal_mix_data_prep.sh $dbase/TAL/TAL_ASR_mix data/tal_mix || exit 1;
+    local/tal_data_prep.sh $dbase/tal/tal_asr_data data/tal_asr || exit 1;
+    local/tal_mix_data_prep.sh $dbase/tal/tal_asr_mix_data data/tal_mix || exit 1;
 
     if $has_aishell2; then
         local/aishell2_data_prep.sh $dbase/aishell2/IOS data/aishell2/train || exit 1;
@@ -150,7 +149,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
         sed -i 's/\xEF\xBB\xBF//' ${feat_dir}_${en_modeling_unit}/test_${x}/text
     done
 
-    tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
+    tools/compute_cmvn_stats.py --num_workers 64 --train_config $train_config \
         --in_scp data/${train_set}/wav.scp \
         --out_cmvn ${feat_dir}_${en_modeling_unit}/$train_set/global_cmvn
 
@@ -182,7 +181,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
-    nj=32
+    nj=64
     # Prepare wenet requried data
     echo "Prepare data, prepare requried format"
     feat_test_sets=""
@@ -210,17 +209,14 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     mkdir -p $dir
     INIT_FILE=$dir/ddp_init
     # You had better rm it manually before you start run.sh on first node.
-    # rm -f $INIT_FILE # delete old one before starting
+    rm -f $INIT_FILE 2>/dev/null # delete old one before starting
     init_method=file://$(readlink -f $INIT_FILE)
-    echo "$0: init method is $init_method"
-    num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
     # Use "nccl" if it works, otherwise use "gloo"
     dist_backend="nccl"
     # The total number of processes/gpus, so that the master knows
     # how many workers to wait for.
     # More details about ddp can be found in
     # https://pytorch.org/tutorials/intermediate/dist_tuto.html
-    world_size=`expr $num_gpus \* $num_nodes`
     echo "total gpus is: $world_size"
     cmvn_opts=
     $cmvn && cp ${feat_dir}_${en_modeling_unit}/$train_set/global_cmvn $dir
@@ -228,14 +224,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     # train.py will write $train_config to $dir/train.yaml with model input
     # and output dimension, train.yaml will be used for inference or model
     # export later
-    for ((i = 0; i < $num_gpus; ++i)); do
-    {
-        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-        # Rank of each gpu/process used for knowing whether it is
-        # the master of a worker.
-        rank=`expr $node_rank \* $num_gpus + $i`
-
-        python wenet/bin/train.py --gpu $gpu_id \
+    $cmd JOB=1:$world_size $dir/log/train.JOB.log \
+        python wenet/bin/train.py \
+            --use_gpu=wait \
             --config $train_config \
             --train_data ${feat_dir}_${en_modeling_unit}/$train_set/format.data \
             --cv_data ${feat_dir}_${en_modeling_unit}/$dev_set/format.data \
@@ -243,14 +234,13 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
             --model_dir $dir \
             --ddp.init_method $init_method \
             --ddp.world_size $world_size \
-            --ddp.rank $rank \
+            --ddp.rank \$[JOB-1] \
             --ddp.dist_backend $dist_backend \
+            --ddp.timeout 60 \
             --num_workers 2 \
+            --use_amp \
             $cmvn_opts \
-            --pin_memory
-    } &
-    done
-    wait
+            --pin_memory || exit 1
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -278,10 +268,10 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     {
         for x in ${test_sets}; do
         {
-            test_dir=$dir/test_${mode}${decoding_chunk_size:+_chunk$decoding_chunk_size}/${x}
+            test_dir=$dir/test_cpu_${mode}${decoding_chunk_size:+_chunk$decoding_chunk_size}/${x}
             mkdir -p $test_dir
-            gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$idx+1])
-            python wenet/bin/recognize.py --gpu $gpu_id \
+            $cmd $test_dir/test_$mode.log python wenet/bin/recognize.py \
+                --use_gpu optional \
                 --mode $mode \
                 --config $dir/train.yaml \
                 --test_data ${feat_dir}_${en_modeling_unit}/test_${x}/format.data \
@@ -292,7 +282,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
                 --dict $dict \
                 --ctc_weight $ctc_weight \
                 --result_file $test_dir/text_${en_modeling_unit} \
-                ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+                ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} || exit 1
             #if $en_modeling_unit = "bpe"; then
             #   tools/spm_decode --model=${bpemodel}.model --input_format=piece < $test_dir/text_${en_modeling_unit} | sed -e "s/▁/ /g" > $test_dir/text
             #else
@@ -302,13 +292,14 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             python tools/compute-wer.py --char=1 --v=1 \
                 ${feat_dir}_${en_modeling_unit}/test_${x}/text.tmp $test_dir/text > $test_dir/wer
             rm ${feat_dir}_${en_modeling_unit}/test_${x}/text.tmp
-        }
+            wer=`grep Overall $test_dir/wer`
+            echo "$x - $mode: $wer"
+        } &
         done
-    } &
+    }
     ((idx+=1))
     done
     wait
-
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then

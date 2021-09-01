@@ -45,7 +45,6 @@ def _spec_augmentation(x,
                        max_f=10,
                        max_w=80):
     """ Deep copy x and do spec augmentation then return it
-
     Args:
         x: input feature, T * F 2D
         num_t_mask: number of time mask to apply
@@ -87,12 +86,10 @@ def _spec_augmentation(x,
 
 def _spec_substitute(x, max_t=20, num_t_sub=3):
     """ Deep copy x and do spec substitute then return it
-
     Args:
         x: input feature, T * F 2D
         max_t: max width of time substitute
         num_t_sub: number of time substitute to apply
-
     Returns:
         augmented feature
     """
@@ -110,9 +107,7 @@ def _spec_substitute(x, max_t=20, num_t_sub=3):
 
 def _waveform_distortion(waveform, distortion_methods_conf):
     """ Apply distortion on waveform
-
     This distortion will not change the length of the waveform.
-
     Args:
         waveform: numpy float tensor, (length,)
         distortion_methods_conf: a list of config for ditortion method.
@@ -140,7 +135,6 @@ def _waveform_distortion(waveform, distortion_methods_conf):
 # return augmented, sr
 def _load_wav_with_speed(wav_file, speed):
     """ Load the wave from file and apply speed perpturbation
-
     Args:
         wav_file: input feature, T * F 2D
 
@@ -175,9 +169,7 @@ def _load_wav_with_speed(wav_file, speed):
 def _extract_feature(batch, speed_perturb, wav_distortion_conf,
                      feature_extraction_conf):
     """ Extract acoustic fbank feature from origin waveform.
-
     Speed perturbation and wave amplitude distortion is optional.
-
     Args:
         batch: a list of tuple (wav id , wave path).
         speed_perturb: bool, whether or not to use speed pertubation.
@@ -269,9 +261,7 @@ def _extract_feature(batch, speed_perturb, wav_distortion_conf,
 
 def _load_feature(batch):
     """ Load acoustic feature from files.
-
     The features have been prepared in previous step, usualy by Kaldi.
-
     Args:
         batch: a list of tuple (wav id , feature ark path).
 
@@ -396,7 +386,6 @@ class AudioDataset(Dataset):
                  sort=True,
                  raw_wav=True):
         """Dataset for loading audio data.
-
         Attributes::
             data_file: input data file
                 Plain text data file, each line contains following 7 fields,
